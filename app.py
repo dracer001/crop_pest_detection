@@ -5,12 +5,16 @@ import numpy as np
 from PIL import Image
 import io
 import base64
+import os
 from datetime import datetime
 from collections import deque
 
 # ── Setup ─────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app)  # allow the dashboard (different origin) to call this API
+# Explicitly allow all origins on every route — the dashboard may be served
+# from this same app, from a static host (Netlify/Vercel), or opened as a
+# local file:// page while testing, so we don't restrict by origin here.
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Load the trained model once at startup
 model = load_model('maize_model.h5')
@@ -152,4 +156,5 @@ def home():
 
 # ── Start Server ──────────────────────────────────────
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
