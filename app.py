@@ -1,102 +1,27 @@
-# ── maize_api/app.py ──────────────────────────────────────────────────────────
-"""
-Maize Disease Detection API
-Two-stage pipeline:
-  Stage 1 → gate_model.pt      (PyTorch) : is there a crop/leaf in the image?
-  Stage 2 → maize_model_v2.h5  (Keras)  : which disease / healthy?
-
-The existing Keras model is used unchanged.
-The gate model is copied from the cassava project (gate_model.pt) — no retraining.
-Response format is IDENTICAL to the original so ESP32 + dashboard need no changes.
-"""
-
-import os, io, base64, logging
+import os, io, base64, logging, requests
 from datetime import datetime, timezone
 from collections import deque
-
-# ── Keras disease model (unchanged) ──────────────────────────────────────────
-import numpy as np
-from PIL import Image
-from tensorflow.keras.models import load_model
-
-# ── PyTorch gate model ────────────────────────────────────────────────────────
-import torch
-import torch.nn.functional as F
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-
 from flask import Flask, request, jsonify, send_from_directory, redirect
 from flask_cors import CORS
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BASE_DIR     = os.path.dirname(__file__)
-GATE_PATH    = os.path.join(BASE_DIR, "gate_model.pt")   # copy from cassava project
-DISEASE_PATH = os.path.join(BASE_DIR, "maize_model_v2.h5")
+# Replace with your actual Hugging Face Space URL trailing with /predict_internal
+HF_API_URL = os.environ.get("HF_API_URL", "https://dracer-maize-pest-disease.hf.space/predict_internal")
 
-CLASS_NAMES  = ['Blight', 'Common_Rust', 'Gray_Leaf_Spot', 'Healthy']
-
-GATE_SIZE   = 160
-GATE_THRESH = 0.55   # slightly lower than cassava (0.6) — maize leaves are narrower
-DEVICE      = torch.device("cpu")
-
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD  = [0.229, 0.224, 0.225]
-
-# Pest thresholds (unchanged from original)
 PEST_TEMP_MIN     = 24.0
 PEST_TEMP_MAX     = 32.0
 PEST_HUMIDITY_MIN = 60.0
 GAS_THRESHOLD     = 1027
 HISTORY_MAXLEN    = 50
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("maize")
 
-# ── Load models ───────────────────────────────────────────────────────────────
-log.info("Loading gate model (PyTorch) ...")
-gate_model = torch.jit.load(GATE_PATH, map_location=DEVICE).eval()
-
-log.info("Loading disease model (Keras) ...")
-disease_model = load_model(DISEASE_PATH)
-
-log.info("Both models ready.")
-
-# ── Flask ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 history        = deque(maxlen=HISTORY_MAXLEN)
 latest_reading = None
-
-# ── Gate preprocessing (PyTorch / albumentations) ─────────────────────────────
-gate_tf = A.Compose([
-    A.Resize(GATE_SIZE, GATE_SIZE),
-    A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ToTensorV2(),
-])
-
-def run_gate(img_bytes):
-    """Returns (is_crop: bool, leaf_confidence: float 0-100)."""
-    img    = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    arr    = np.array(img)
-    tensor = gate_tf(image=arr)["image"].unsqueeze(0).to(DEVICE)
-    with torch.no_grad():
-        probs = F.softmax(gate_model(tensor), dim=1)[0]
-    leaf_conf = probs[1].item()
-    return leaf_conf >= GATE_THRESH, round(leaf_conf * 100, 1)
-
-# ── Disease preprocessing (Keras — unchanged from original) ───────────────────
-def run_disease(img_bytes):
-    """Returns (class_name: str, confidence: float 0-100)."""
-    img      = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    img      = img.resize((224, 224))
-    arr      = np.array(img) / 255.0
-    arr      = np.expand_dims(arr, axis=0)
-    preds    = disease_model.predict(arr, verbose=0)
-    idx      = int(np.argmax(preds[0]))
-    conf     = float(np.max(preds[0])) * 100
-    return CLASS_NAMES[idx], round(conf, 1)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def parse_float(v):
@@ -121,7 +46,9 @@ def predict():
     if 'image' not in request.files:
         return jsonify({'error': 'No image provided'}), 400
 
-    img_bytes   = request.files['image'].read()
+    # Extract form data
+    img_file    = request.files['image']
+    img_bytes   = img_file.read()
     temperature = parse_float(request.form.get('temperature'))
     humidity    = parse_float(request.form.get('humidity'))
     gas         = parse_float(request.form.get('gas_raw'))
@@ -131,13 +58,19 @@ def predict():
     ts      = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     try:
-        # ── Stage 1: Gate ─────────────────────────────────────────────────────
-        is_crop, leaf_conf = run_gate(img_bytes)
+        # Reset image file pointer to pass it along to Hugging Face
+        img_file.seek(0)
+        hf_response = requests.post(HF_API_URL, files={'image': (img_file.filename, img_file.stream, img_file.mimetype)})
+        
+        if hf_response.status_code != 200:
+            return jsonify({'error': f'Hugging Face endpoint returned error: {hf_response.text}'}), 500
+        
+        hf_data = hf_response.json()
 
-        if not is_crop:
-            log.info(f"Gate rejected — leaf_conf={leaf_conf}%")
+        # ── Stage 1 Verification (From HF Response) ───────────────────────────
+        if not hf_data.get('is_crop', False):
+            log.info(f"Gate rejected — leaf_conf={hf_data.get('leaf_conf')}%")
             result = {
-                # Exact same keys ESP32 + dashboard already read
                 'disease'      : 'No Crop Detected',
                 'confidence'   : '0.0%',
                 'status'       : 'NO_CROP',
@@ -153,14 +86,14 @@ def predict():
             history.appendleft(result)
             return jsonify(result)
 
-        # ── Stage 2: Disease (existing Keras model, untouched) ────────────────
-        predicted_class, confidence = run_disease(img_bytes)
+        # ── Stage 2 Extraction ────────────────────────────────────────────────
+        predicted_class = hf_data.get('predicted_class')
+        confidence      = hf_data.get('confidence')
 
         log.info(f"Prediction: {predicted_class} ({confidence}%) | "
                  f"T={temperature} H={humidity} Gas={gas} | Pest risk: {pest_risk}")
 
         result = {
-            # Exact same keys as the original app
             'disease'      : predicted_class,
             'confidence'   : f'{confidence:.1f}%',
             'status'       : 'ALERT' if predicted_class != 'Healthy' else 'OK',
@@ -178,10 +111,10 @@ def predict():
         return jsonify(result)
 
     except Exception as e:
-        log.exception("Prediction error")
+        log.exception("Prediction proxy error")
         return jsonify({'error': str(e)}), 500
 
-# ── Original routes (all unchanged) ──────────────────────────────────────────
+# ── Original routes (all completely unchanged) ───────────────────────────────
 @app.route('/latest')
 def get_latest():
     if latest_reading is None:
@@ -202,7 +135,7 @@ def home():
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'ok', 'models_loaded': True})
+    return jsonify({'status': 'ok', 'models_loaded': False, 'proxy_mode': True})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
