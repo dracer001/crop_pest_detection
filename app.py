@@ -17,7 +17,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Load the trained model once at startup
-model = load_model('maize_model.h5')
+model = load_model('maize_model_v2.h5')
 
 # These must match exactly what was used during training
 CLASS_NAMES = ['Blight', 'Common_Rust', 'Gray_Leaf_Spot', 'Healthy']
