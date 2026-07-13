@@ -1,142 +1,160 @@
-import os, io, base64, logging, requests
-from datetime import datetime, timezone
-from collections import deque
 from flask import Flask, request, jsonify, send_from_directory, redirect
 from flask_cors import CORS
+from tensorflow.keras.models import load_model
+import numpy as np
+from PIL import Image
+import io
+import base64
+import os
+from datetime import datetime
+from collections import deque
 
-# ── Config ────────────────────────────────────────────────────────────────────
-# Replace with your actual Hugging Face Space URL trailing with /predict_internal
-HF_API_URL = os.environ.get("HF_API_URL", "https://dracer-maize-pest-disease.hf.space/predict_internal")
-
-PEST_TEMP_MIN     = 24.0
-PEST_TEMP_MAX     = 32.0
-PEST_HUMIDITY_MIN = 60.0
-GAS_THRESHOLD     = 1027
-HISTORY_MAXLEN    = 50
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("maize")
-
+# ── Setup ─────────────────────────────────────────────
 app = Flask(__name__)
+# Explicitly allow all origins on every route — the dashboard may be served
+# from this same app, from a static host (Netlify/Vercel), or opened as a
+# local file:// page while testing, so we don't restrict by origin here.
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-history        = deque(maxlen=HISTORY_MAXLEN)
+# Load the trained model once at startup
+model = load_model('maize_model_v2.h5')
+
+# These must match exactly what was used during training
+CLASS_NAMES = ['Blight', 'Common_Rust', 'Gray_Leaf_Spot', 'Healthy']
+
+# ── Pest-favorable environment thresholds ─────────────
+# Based on fall armyworm (Spodoptera frugiperda) studies — the dominant
+# maize pest in Nigeria. Optimal development/survival is widely reported
+# around 24-32°C, with 52-88% relative humidity supporting rearing/activity.
+# These are reasonable defaults for a demo, not a validated field model —
+# tune them if your own observations point elsewhere.
+PEST_TEMP_MIN = 24.0        # °C, lower bound of favorable range
+PEST_TEMP_MAX = 32.0        # °C, upper bound of favorable range
+PEST_HUMIDITY_MIN = 60.0    # %RH, above this humidity favors pest activity
+
+# Gas sensor (e.g. MQ135) — elevated readings can indicate decomposing
+# plant matter or crop stress that tends to attract pests. There's no
+# universally agreed ppm threshold for this, so treat it as a heuristic
+# and calibrate GAS_THRESHOLD against your own sensor's baseline readings.
+GAS_THRESHOLD = 1027         # raw ADC / ppm-equivalent, calibrate per sensor
+
+# In-memory store of recent readings (most recent first). Fine for a demo;
+# swap for a real database if you need this to survive a restart.
+HISTORY_MAXLEN = 50
+history = deque(maxlen=HISTORY_MAXLEN)
 latest_reading = None
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def parse_float(v):
-    try:    return float(v)
-    except: return None
+
+# ── Helper Functions ───────────────────────────────────
+def prepare_image(img_bytes):
+    img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+    img = img.resize((224, 224))          # Match training size
+    img_array = np.array(img) / 255.0    # Normalize pixels
+    img_array = np.expand_dims(img_array, axis=0)
+    return img_array
+
 
 def assess_pest_risk(temperature, humidity, gas):
+    """Returns ('HIGH'|'LOW', [reasons]) based on sensor thresholds."""
     reasons = []
-    temp_ok = temperature is not None and PEST_TEMP_MIN <= temperature <= PEST_TEMP_MAX
-    hum_ok  = humidity    is not None and humidity >= PEST_HUMIDITY_MIN
-    gas_ok  = gas         is not None and gas      >= GAS_THRESHOLD
-    if temp_ok: reasons.append(f"Temperature {temperature:.1f}°C is in the pest-favorable range")
-    if hum_ok:  reasons.append(f"Humidity {humidity:.1f}% is above the {PEST_HUMIDITY_MIN:.0f}% threshold")
-    if gas_ok:  reasons.append(f"Gas reading {gas:.0f} is above the {GAS_THRESHOLD:.0f} threshold")
-    return ("HIGH" if (temp_ok and (hum_ok or gas_ok)) else "LOW"), reasons
 
-# ── /predict ──────────────────────────────────────────────────────────────────
+    temp_favorable = (temperature is not None and
+                       PEST_TEMP_MIN <= temperature <= PEST_TEMP_MAX)
+    humidity_favorable = (humidity is not None and humidity >= PEST_HUMIDITY_MIN)
+    gas_elevated = (gas is not None and gas >= GAS_THRESHOLD)
+
+    if temp_favorable:
+        reasons.append(f'Temperature {temperature:.1f}°C is in the pest-favorable range')
+    if humidity_favorable:
+        reasons.append(f'Humidity {humidity:.1f}% is above the {PEST_HUMIDITY_MIN:.0f}% threshold')
+    if gas_elevated:
+        reasons.append(f'Gas reading {gas:.0f} is above the {GAS_THRESHOLD:.0f} threshold')
+
+    # Flag HIGH risk when temperature is favorable AND at least one other
+    # signal (humidity or gas) also points the same way.
+    is_high_risk = temp_favorable and (humidity_favorable or gas_elevated)
+
+    return ('HIGH' if is_high_risk else 'LOW'), reasons
+
+
+def parse_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# ── Main Prediction Route (called by the ESP32-CAM) ──
 @app.route('/predict', methods=['POST'])
 def predict():
-    global latest_reading
-
     if 'image' not in request.files:
         return jsonify({'error': 'No image provided'}), 400
 
-    # Extract form data
-    img_file    = request.files['image']
-    img_bytes   = img_file.read()
+    img_file = request.files['image']
+    img_bytes = img_file.read()
+
+    # Sensor readings sent alongside the image as form fields
     temperature = parse_float(request.form.get('temperature'))
-    humidity    = parse_float(request.form.get('humidity'))
-    gas         = parse_float(request.form.get('gas_raw'))
+    humidity = parse_float(request.form.get('humidity'))
+    gas = parse_float(request.form.get('gas_raw'))
+
+    # Prepare image and run prediction
+    img_array = prepare_image(img_bytes)
+    predictions = model.predict(img_array)
+    predicted_index = np.argmax(predictions[0])
+    predicted_class = CLASS_NAMES[predicted_index]
+    confidence = float(np.max(predictions[0])) * 100
 
     pest_risk, pest_reasons = assess_pest_risk(temperature, humidity, gas)
-    img_b64 = 'data:image/jpeg;base64,' + base64.b64encode(img_bytes).decode()
-    ts      = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    try:
-        # Reset image file pointer to pass it along to Hugging Face
-        img_file.seek(0)
-        hf_response = requests.post(HF_API_URL, files={'image': (img_file.filename, img_file.stream, img_file.mimetype)})
-        
-        if hf_response.status_code != 200:
-            return jsonify({'error': f'Hugging Face endpoint returned error: {hf_response.text}'}), 500
-        
-        hf_data = hf_response.json()
+    # Build the response
+    result = {
+        'disease'         : predicted_class,
+        'confidence'      : f'{confidence:.1f}%',
+        'status'          : 'ALERT' if predicted_class != 'Healthy' else 'OK',
+        'temperature'     : temperature,
+        'humidity'        : humidity,
+        'gas'             : gas,
+        'pest_risk'       : pest_risk,
+        'pest_reasons'    : pest_reasons,
+        'timestamp'       : datetime.utcnow().isoformat() + 'Z',
+        'image'           : 'data:image/jpeg;base64,' + base64.b64encode(img_bytes).decode('utf-8'),
+    }
 
-        # ── Stage 1 Verification (From HF Response) ───────────────────────────
-        if not hf_data.get('is_crop', False):
-            log.info(f"Gate rejected — leaf_conf={hf_data.get('leaf_conf')}%")
-            result = {
-                'disease'      : 'No Crop Detected',
-                'confidence'   : '0.0%',
-                'status'       : 'NO_CROP',
-                'temperature'  : temperature,
-                'humidity'     : humidity,
-                'gas'          : gas,
-                'pest_risk'    : pest_risk,
-                'pest_reasons' : pest_reasons,
-                'timestamp'    : ts,
-                'image'        : img_b64,
-            }
-            latest_reading = result
-            history.appendleft(result)
-            return jsonify(result)
+    global latest_reading
+    latest_reading = result
+    history.appendleft(result)
 
-        # ── Stage 2 Extraction ────────────────────────────────────────────────
-        predicted_class = hf_data.get('predicted_class')
-        confidence      = hf_data.get('confidence')
+    print(f'Prediction: {predicted_class} ({confidence:.1f}%) | '
+          f'T={temperature} H={humidity} Gas={gas} | Pest risk: {pest_risk}')
 
-        log.info(f"Prediction: {predicted_class} ({confidence}%) | "
-                 f"T={temperature} H={humidity} Gas={gas} | Pest risk: {pest_risk}")
+    return jsonify(result)
 
-        result = {
-            'disease'      : predicted_class,
-            'confidence'   : f'{confidence:.1f}%',
-            'status'       : 'ALERT' if predicted_class != 'Healthy' else 'OK',
-            'temperature'  : temperature,
-            'humidity'     : humidity,
-            'gas'          : gas,
-            'pest_risk'    : pest_risk,
-            'pest_reasons' : pest_reasons,
-            'timestamp'    : ts,
-            'image'        : img_b64,
-        }
 
-        latest_reading = result
-        history.appendleft(result)
-        return jsonify(result)
-
-    except Exception as e:
-        log.exception("Prediction proxy error")
-        return jsonify({'error': str(e)}), 500
-
-# ── Original routes (all completely unchanged) ───────────────────────────────
-@app.route('/latest')
+# ── Dashboard Polling Routes ───────────────────────────
+@app.route('/latest', methods=['GET'])
 def get_latest():
     if latest_reading is None:
         return jsonify({'error': 'No readings yet'}), 404
     return jsonify(latest_reading)
 
-@app.route('/history')
+
+@app.route('/history', methods=['GET'])
 def get_history():
     return jsonify(list(history))
 
-@app.route('/dashboard')
+
+
+@app.route('/dashboard', methods=['GET'])
 def dashboard():
     return send_from_directory('static', 'dashboard.html')
 
-@app.route('/')
+# ── Health Check Route ────────────────────────────────
+@app.route('/', methods=['GET'])
 def home():
     return redirect('/dashboard')
 
-@app.route('/health')
-def health():
-    return jsonify({'status': 'ok', 'models_loaded': False, 'proxy_mode': True})
-
+# ── Start Server ──────────────────────────────────────
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
